@@ -73,6 +73,15 @@ class OpenCodeGoProfile(ProviderProfile):
         extra_body: dict[str, Any] = {}
         top_level: dict[str, Any] = {}
 
+        if _flat_model_name(model) == "ox-alpha-free":
+            # Ox Alpha via the Go relay shares the x-preview-f-free wire
+            # contract (reasoning_effort low/high/max only). Without this
+            # branch the override below returns empty for the model, the
+            # generic extra_body.reasoning fallback never fires (the profile
+            # override marks reasoning as handled), and any configured
+            # effort is silently dropped (#ox-alpha-effort-dropped).
+            return _build_ox_alpha_reasoning_extras(reasoning_config, model)
+
         if _is_glm_5_2_model(model):
             # GLM-5.2 on OpenCode Go uses its native OpenAI-compatible
             # reasoning_effort knob (high/max — declared in
@@ -167,7 +176,7 @@ def _build_ox_alpha_reasoning_extras(
     profile — the model is reachable through either provider and the wire
     contract is identical (low/high/max only; anything else 400s).
     """
-    if _flat_model_name(model) != "x-preview-f-free":
+    if _flat_model_name(model) not in {"x-preview-f-free", "ox-alpha-free"}:
         return {}, {}
     if not isinstance(reasoning_config, dict):
         return {}, {}

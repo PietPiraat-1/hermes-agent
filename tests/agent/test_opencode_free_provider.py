@@ -118,3 +118,83 @@ class TestOpenCodeFreeRuntimeKeyless:
         )
         assert rt is not None
         assert rt["api_mode"] == "codex_responses"
+
+
+class TestOxAlphaReasoningEffortPropagation:
+    """ox-alpha reasoning_effort must reach the wire on every profile that
+    serves it.
+
+    The ox-alpha wire contract is low/high/max only (anything else 400s).
+    Regression context: OpenCodeGoProfile.build_api_kwargs_extras was
+    overridden (so the generic extra_body.reasoning fallback never fired)
+    but had no ox-alpha branch, and _build_ox_alpha_reasoning_extras only
+    matched x-preview-f-free — so a configured effort was silently dropped
+    for ``ox-alpha-free`` on opencode-go.
+    """
+
+    def test_go_profile_high_passes_through(self):
+        from providers import get_provider_profile
+
+        profile = get_provider_profile("opencode-go")
+        _, top_level = profile.build_api_kwargs_extras(
+            reasoning_config={"enabled": True, "effort": "high"},
+            model="ox-alpha-free",
+        )
+        assert top_level == {"reasoning_effort": "high"}
+
+    def test_go_profile_ultra_clamps_to_max(self):
+        """ultra is Hermes-internal vocabulary; ox-alpha tops out at max."""
+        from providers import get_provider_profile
+
+        profile = get_provider_profile("opencode-go")
+        _, top_level = profile.build_api_kwargs_extras(
+            reasoning_config={"enabled": True, "effort": "ultra"},
+            model="ox-alpha-free",
+        )
+        assert top_level == {"reasoning_effort": "max"}
+
+    def test_go_profile_medium_clamps_down_to_low(self):
+        """Clamping never escalates cost: medium → low on a 3-tier wire."""
+        from providers import get_provider_profile
+
+        profile = get_provider_profile("opencode-go")
+        _, top_level = profile.build_api_kwargs_extras(
+            reasoning_config={"enabled": True, "effort": "medium"},
+            model="ox-alpha-free",
+        )
+        assert top_level == {"reasoning_effort": "low"}
+
+    def test_disabled_reasoning_sends_nothing(self):
+        from providers import get_provider_profile
+
+        profile = get_provider_profile("opencode-go")
+        extra_body, top_level = profile.build_api_kwargs_extras(
+            reasoning_config={"enabled": False},
+            model="ox-alpha-free",
+        )
+        assert extra_body == {}
+        assert top_level == {}
+
+    def test_unrelated_model_still_gets_nothing(self):
+        """Models without a declared contract keep server defaults."""
+        from providers import get_provider_profile
+
+        profile = get_provider_profile("opencode-go")
+        extra_body, top_level = profile.build_api_kwargs_extras(
+            reasoning_config={"enabled": True, "effort": "high"},
+            model="some-future-relay-model",
+        )
+        assert extra_body == {}
+        assert top_level == {}
+
+    def test_zen_free_profile_accepts_both_slugs(self):
+        """x-preview-f-free and ox-alpha-free share one wire contract."""
+        from plugins.model_providers.opencode_zen import (
+            _build_ox_alpha_reasoning_extras,
+        )
+
+        for slug in ("x-preview-f-free", "ox-alpha-free"):
+            _, top_level = _build_ox_alpha_reasoning_extras(
+                {"enabled": True, "effort": "high"}, slug
+            )
+            assert top_level == {"reasoning_effort": "high"}, slug
