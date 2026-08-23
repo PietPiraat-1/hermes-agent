@@ -146,6 +146,15 @@ class CLIAgentSetupMixin:
         self.api_key = api_key
         self.base_url = base_url
 
+        # Per-provider output cap (custom_providers ``max_output_tokens`` /
+        # ``max_tokens``) — mirrors gateway/run.py: applied only when the
+        # documented global model.max_tokens / HERMES_MAX_TOKENS left
+        # self.max_tokens unset, so the global key still wins.
+        if self.max_tokens is None:
+            _runtime_mot = runtime.get("max_output_tokens")
+            if isinstance(_runtime_mot, int) and _runtime_mot > 0:
+                self.max_tokens = _runtime_mot
+
         # When a custom_provider entry carries an explicit `model` field,
         # use it as the effective model name.  Without this, running
         # `hermes chat --model <provider-name>` sends the provider name
