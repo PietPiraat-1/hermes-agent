@@ -7971,6 +7971,9 @@ class AIAgent:
         Some providers/routes reject `reasoning` with 400s, so gate it to
         known reasoning-capable model families and direct Nous Portal.
         """
+        # Proton Lumo proxy (Aperture) supports reasoning
+        if base_url_host_matches(self._base_url_lower, "raccoon-fence.ts.net"):
+            return True
         if base_url_host_matches(self._base_url_lower, "nousresearch.com"):
             return True
         if base_url_host_matches(self._base_url_lower, "ai-gateway.vercel.sh"):

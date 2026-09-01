@@ -1306,6 +1306,7 @@ def apply_subprocess_home_env(env: dict[str, str]) -> None:
 
 VALID_REASONING_EFFORTS = (
     "minimal", "low", "medium", "high", "xhigh", "max", "ultra",
+    "fast", "thinking",  # Proton Lumo specific modes
 )
 
 

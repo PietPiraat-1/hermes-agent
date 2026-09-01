@@ -9388,7 +9388,17 @@ def _recover_aux_response_message(response: Any) -> Optional[Any]:
     Auxiliary callers consume ``choices[0].message``.  Some compatible
     endpoints return text outside ``choices`` (for example ``output_text`` or
     ``output`` items).  Preserve that response before declaring it malformed.
+    
+    Also handles raw SSE streaming responses (e.g., from proxies that force
+    streaming for large payloads) by parsing the chunks and reconstructing
+    a complete chat completion object.
     """
+    # First, try to parse SSE if the response is a raw string
+    if isinstance(response, str):
+        parsed = _parse_sse_response(response)
+        if parsed is not None:
+            return parsed
+    
     text = _extract_aux_response_text(response)
     if not text:
         return None
@@ -9408,6 +9418,97 @@ def _recover_aux_response_message(response: Any) -> Optional[Any]:
             choices=[choice],
             usage=getattr(response, "usage", None),
         )
+
+
+def _parse_sse_response(raw: str) -> Optional[Any]:
+    """Parse raw SSE streaming response into a chat completion object.
+    
+    Handles OpenAI-style SSE format where each line starts with 'data:' followed
+    by JSON chunks. Concatenates delta.content values and reconstructs a full
+    response object with choices[0].message.content.
+    
+    Args:
+        raw: Raw string response containing SSE chunks
+        
+    Returns:
+        A SimpleNamespace with choices[0].message.content populated, or None
+        if the input is not valid SSE.
+    """
+    if not raw or not isinstance(raw, str):
+        return None
+    
+    # Check if this looks like SSE
+    if 'data:' not in raw:
+        return None
+    
+    lines = raw.split('\n')
+    chunks = []
+    metadata = {}
+    
+    for line in lines:
+        line = line.strip()
+        if not line or line == 'data:[DONE]':
+            continue
+        
+        if line.startswith('data:'):
+            json_str = line[5:].strip()  # Remove 'data:' prefix
+            if not json_str or json_str == '[DONE]':
+                continue
+            
+            try:
+                chunk = json.loads(json_str)
+                chunks.append(chunk)
+                
+                # Extract metadata from first chunk
+                if not metadata:
+                    metadata = {
+                        'id': chunk.get('id', ''),
+                        'model': chunk.get('model', ''),
+                        'created': chunk.get('created', 0),
+                    }
+                    
+            except json.JSONDecodeError:
+                continue
+    
+    if not chunks:
+        return None
+    
+    # Reconstruct the full message content from deltas
+    full_content = ""
+    usage = None
+    
+    for chunk in chunks:
+        choices = chunk.get('choices', [])
+        if choices:
+            delta = choices[0].get('delta', {})
+            if 'content' in delta and delta['content']:
+                full_content += delta['content']
+        
+        # Extract usage from the last chunk
+        if 'usage' in chunk:
+            usage = chunk['usage']
+    
+    if not full_content:
+        return None
+    
+    # Build a proper chat completion response object
+    choice = SimpleNamespace(
+        index=0,
+        message=SimpleNamespace(
+            role='assistant',
+            content=full_content,
+        ),
+        finish_reason='stop',
+    )
+    
+    return SimpleNamespace(
+        id=metadata.get('id', ''),
+        model=metadata.get('model', ''),
+        created=metadata.get('created', 0),
+        object='chat.completion',
+        choices=[choice],
+        usage=usage,
+    )
 
 
 def _extract_aux_response_text(response: Any) -> str:

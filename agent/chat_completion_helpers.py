@@ -1000,7 +1000,183 @@ def _dispatch_nonstreaming_api_request(agent, api_kwargs: dict, *, make_client):
             api_kwargs.pop("_moa_prepared_request", None)
         return agent.client.chat.completions.create(**api_kwargs)
     request_client = make_client("chat_completion_request")
-    return request_client.chat.completions.create(**api_kwargs)
+    try:
+        result = request_client.chat.completions.create(**api_kwargs)
+        
+        # Handle Lumo/Aperture proxy returning raw SSE text instead of ChatCompletion
+        # This happens when the proxy ignores stream=False for large payloads
+        if agent.provider and ("aperture" in str(agent.provider).lower() or "lumo" in str(agent.model or "").lower()):
+            if isinstance(result, str):
+                import logging
+                import json
+                import re
+                
+                logging.warning(f"[LUMO FIX] Received SSE string, parsing... Length: {len(result)}")
+                
+                # Parse SSE format: accumulate all chunks and reconstruct full response
+                def extract_balanced_json(s: str) -> list:
+                    """Extract all balanced JSON objects from SSE data blocks."""
+                    results = []
+                    i = 0
+                    while i < len(s):
+                        idx = s.find('data:', i)
+                        if idx == -1:
+                            break
+                        
+                        start = idx + 5
+                        while start < len(s) and s[start] in ' \t\n\r':
+                            start += 1
+                        
+                        if start >= len(s) or s[start] != '{':
+                            i = idx + 1
+                            continue
+                        
+                        depth = 0
+                        in_string = False
+                        escape_next = False
+                        json_end = start
+                        
+                        for j in range(start, len(s)):
+                            char = s[j]
+                            
+                            if escape_next:
+                                escape_next = False
+                                continue
+                            
+                            if char == '\\' and in_string:
+                                escape_next = True
+                                continue
+                            
+                            if char == '"' and not escape_next:
+                                in_string = not in_string
+                                continue
+                            
+                            if in_string:
+                                continue
+                            
+                            if char == '{':
+                                depth += 1
+                            elif char == '}':
+                                depth -= 1
+                                if depth == 0:
+                                    json_end = j + 1
+                                    break
+                        
+                        if depth == 0 and json_end > start:
+                            json_str = s[start:json_end]
+                            results.append(json_str)
+                            i = json_end
+                        else:
+                            i = idx + 1
+                    
+                    return results
+                
+                data_blocks = extract_balanced_json(result)
+                
+                if not data_blocks:
+                    logging.error(f"[LUMO FIX] No data blocks found in SSE response")
+                    logging.error(f"[LUMO FIX] Raw response preview: {result[:1000]}")
+                    raise ValueError(f"Could not parse SSE response: {result[:200]}")
+                
+                # Accumulate deltas from all chunks to reconstruct full response
+                accumulated = {
+                    "id": None,
+                    "model": None,
+                    "created": None,
+                    "choices": {},  # index -> choice data
+                    "usage": None,
+                }
+                
+                for json_str in data_blocks:
+                    try:
+                        chunk = json.loads(json_str)
+                        
+                        if accumulated["id"] is None:
+                            accumulated["id"] = chunk.get("id")
+                        if accumulated["model"] is None:
+                            accumulated["model"] = chunk.get("model")
+                        if accumulated["created"] is None:
+                            accumulated["created"] = chunk.get("created")
+                        
+                        if "usage" in chunk:
+                            accumulated["usage"] = chunk["usage"]
+                        
+                        if "choices" in chunk:
+                            for c in chunk["choices"]:
+                                idx = c.get("index", 0)
+                                if idx not in accumulated["choices"]:
+                                    accumulated["choices"][idx] = {
+                                        "delta": {"role": None, "content": "", "tool_calls": [], "reasoning_content": ""},
+                                        "finish_reason": None,
+                                    }
+                                
+                                delta = c.get("delta", {})
+                                acc_delta = accumulated["choices"][idx]["delta"]
+                                
+                                if "role" in delta and delta["role"]:
+                                    acc_delta["role"] = delta["role"]
+                                if "content" in delta and delta["content"]:
+                                    acc_delta["content"] += delta["content"]
+                                if "reasoning" in delta and delta["reasoning"]:
+                                    acc_delta["reasoning_content"] += delta["reasoning"]
+                                if "tool_calls" in delta and delta["tool_calls"]:
+                                    acc_delta["tool_calls"].extend(delta["tool_calls"])
+                                
+                                if "finish_reason" in c and c["finish_reason"]:
+                                    accumulated["choices"][idx]["finish_reason"] = c["finish_reason"]
+                    
+                    except json.JSONDecodeError:
+                        logging.warning(f"[LUMO FIX] Skipping malformed chunk: {json_str[:100]}")
+                        continue
+                
+                # Reconstruct full ChatCompletion from accumulated data
+                from openai.types.chat import ChatCompletion
+                from openai.types.chat.chat_completion import Choice
+                from openai.types.chat.chat_completion_message import ChatCompletionMessage
+                
+                choices = []
+                for idx, choice_data in sorted(accumulated["choices"].items()):
+                    msg_obj = ChatCompletionMessage(
+                        role=choice_data["delta"]["role"] or "assistant",
+                        content=choice_data["delta"]["content"],
+                        tool_calls=choice_data["delta"]["tool_calls"] if choice_data["delta"]["tool_calls"] else None,
+                    )
+                    
+                    # Add reasoning_content if present
+                    if choice_data["delta"].get("reasoning_content"):
+                        msg_obj.reasoning_content = choice_data["delta"]["reasoning_content"]
+                    
+                    choice = Choice(
+                        index=idx,
+                        message=msg_obj,
+                        finish_reason=choice_data["finish_reason"] or "stop",
+                    )
+                    choices.append(choice)
+                
+                chat_completion = ChatCompletion(
+                    id=accumulated["id"] or "unknown",
+                    choices=choices,
+                    created=accumulated["created"] or 0,
+                    model=accumulated["model"] or "lumo-max",
+                    object="chat.completion",
+                    usage=accumulated["usage"],
+                )
+                
+                logging.info(f"[LUMO FIX] Successfully reconstructed ChatCompletion with {len(choices)} choices")
+                return chat_completion
+        
+        return result
+    except TypeError as te:
+        # Debug log for TypeError
+        if agent.provider and "aperture" in str(agent.provider).lower():
+            import logging
+            logging.error(f"[DEBUG] Aperture API call raised TypeError: {te}")
+            logging.error(f"[DEBUG] api_kwargs keys: {list(api_kwargs.keys())}")
+            if 'extra_body' in api_kwargs:
+                logging.error(f"[DEBUG] extra_body: {api_kwargs['extra_body']}")
+            if 'stream' in api_kwargs:
+                logging.error(f"[DEBUG] stream: {api_kwargs['stream']}")
+        raise
 
 
 def should_use_direct_api_call(agent) -> bool:

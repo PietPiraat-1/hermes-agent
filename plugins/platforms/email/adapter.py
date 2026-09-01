@@ -592,6 +592,14 @@ class EmailAdapter(BasePlatformAdapter):
             extra.get("authserv_id", "") or _get_secret("EMAIL_AUTHSERV_ID", "")
         ).strip().lower()
 
+        # Recipient addresses to NOT reply to (comma-separated).
+        # Emails sent to these addresses are processed but no reply is sent.
+        # Example: EMAIL_NO_REPLY_TO=dev-bot@aarts.us,test@spam.com
+        no_reply_raw = os.getenv("EMAIL_NO_REPLY_TO", "").strip()
+        self._no_reply_to: set = set()
+        if no_reply_raw:
+            self._no_reply_to = {addr.strip().lower() for addr in no_reply_raw.split(",") if addr.strip()}
+
         # Track message IDs we've already processed to avoid duplicates
         self._seen_uids: set = set()
         self._seen_uids_max: int = 2000   # cap to prevent unbounded memory growth
@@ -639,10 +647,22 @@ class EmailAdapter(BasePlatformAdapter):
         failures through an IPv4-only socket path, without mutating global
         resolver state.  TLS verification errors are not retried.
 
+        For localhost/self-signed certificates (e.g., Proton Mail Bridge),
+        certificate verification is disabled to allow connections.
+
         Returns a connected SMTP object with TLS established — callers
         can proceed directly to ``login()``.
         """
-        ctx = ssl.create_default_context()
+        # For localhost connections, disable certificate verification to support
+        # self-signed certificates (common with local mail bridges like Proton)
+        is_localhost = self._smtp_host in ("127.0.0.1", "::1", "localhost")
+        if is_localhost:
+            ctx = ssl.create_default_context()
+            ctx.check_hostname = False
+            ctx.verify_mode = ssl.CERT_NONE
+        else:
+            ctx = ssl.create_default_context()
+        
         host = self._smtp_host
         port = self._smtp_port
 
@@ -709,9 +729,23 @@ class EmailAdapter(BasePlatformAdapter):
             # per retry) against an unreachable/proxied host this grew
             # monotonically until fd exhaustion on macOS's 256 soft limit
             # (#79889).
+            # LOCAL CUSTOMIZATION (Proton Mail Bridge): use IMAP4 + STARTTLS
+            # for non-993 ports (Bridge listens on 1143 with a self-signed
+            # cert); IMAP4_SSL only for implicit TLS on port 993.
             imap = None
             try:
-                imap = imaplib.IMAP4_SSL(self._imap_host, self._imap_port, timeout=30)
+                if self._imap_port == 993:
+                    imap = imaplib.IMAP4_SSL(self._imap_host, self._imap_port, timeout=30)
+                else:
+                    imap = imaplib.IMAP4(self._imap_host, self._imap_port, timeout=30)
+                    is_localhost = self._imap_host in ("127.0.0.1", "::1", "localhost")
+                    if is_localhost:
+                        ctx = ssl.create_default_context()
+                        ctx.check_hostname = False
+                        ctx.verify_mode = ssl.CERT_NONE
+                        imap.starttls(ssl_context=ctx)
+                    else:
+                        imap.starttls()
                 imap.login(self._address, self._password)
                 _send_imap_id(imap)
                 imap.select("INBOX")
@@ -855,7 +889,21 @@ class EmailAdapter(BasePlatformAdapter):
         results = []
         imap: Optional[imaplib.IMAP4] = None
         try:
-            imap = imaplib.IMAP4_SSL(self._imap_host, self._imap_port, timeout=30)
+            # Use IMAP4 + STARTTLS for non-993 ports (e.g., Proton Mail Bridge on 1143)
+            # Use IMAP4_SSL for implicit TLS on port 993
+            if self._imap_port == 993:
+                imap = imaplib.IMAP4_SSL(self._imap_host, self._imap_port, timeout=30)
+            else:
+                imap = imaplib.IMAP4(self._imap_host, self._imap_port, timeout=30)
+                # For localhost/self-signed certificates, disable verification
+                is_localhost = self._imap_host in ("127.0.0.1", "::1", "localhost")
+                if is_localhost:
+                    ctx = ssl.create_default_context()
+                    ctx.check_hostname = False
+                    ctx.verify_mode = ssl.CERT_NONE
+                    imap.starttls(ssl_context=ctx)
+                else:
+                    imap.starttls()
             try:
                 imap.login(self._address, self._password)
                 _send_imap_id(imap)
@@ -951,6 +999,10 @@ class EmailAdapter(BasePlatformAdapter):
         subject = _decode_header_value(msg.get("Subject", "(no subject)"))
         message_id = msg.get("Message-ID", "")
         in_reply_to = msg.get("In-Reply-To", "")
+        # LOCAL CUSTOMIZATION (Proton): extract the recipient (To:) address
+        # — used downstream for no-reply filtering (EMAIL_NO_REPLY_TO).
+        to_header = msg.get("To", "")
+        to_addr = _extract_email_address(to_header) if to_header else ""
         # Skip automated/noreply senders before any processing
         msg_headers = dict(msg.items())
         if _is_automated_sender(sender_addr, msg_headers):
@@ -977,6 +1029,7 @@ class EmailAdapter(BasePlatformAdapter):
             "subject": subject,
             "message_id": message_id,
             "in_reply_to": in_reply_to,
+            "to_addr": to_addr,  # LOCAL: recipient address for no-reply filtering
             "body": body,
             "attachments": attachments,
             "date": msg.get("Date", ""),
@@ -1103,9 +1156,11 @@ class EmailAdapter(BasePlatformAdapter):
                 msg_type = MessageType.DOCUMENT
 
         # Store thread context for reply threading
+        # Include to_addr so we can suppress replies to certain recipient addresses
         self._thread_context[sender_addr] = {
             "subject": subject,
             "message_id": msg_data["message_id"],
+            "to_addr": msg_data.get("to_addr", ""),  # Original recipient address
         }
 
         source = self.build_source(
@@ -1164,12 +1219,24 @@ class EmailAdapter(BasePlatformAdapter):
         reply_to_msg_id: Optional[str] = None,
     ) -> str:
         """Send an email via SMTP. Runs in executor thread."""
+        # Check if we should suppress replies based on the original recipient address
+        # to_addr here is the sender we're replying to; get the original recipient from thread context
+        ctx = self._thread_context.get(to_addr, {})
+        original_recipient = ctx.get("to_addr", "").lower()
+        
+        if original_recipient and original_recipient in self._no_reply_to:
+            logger.info(
+                "[Email] Suppressing reply to %s (original recipient: %s is in no-reply list)",
+                to_addr,
+                original_recipient,
+            )
+            return ""  # Return empty message ID to indicate suppressed reply
+        
         msg = MIMEMultipart()
         msg["From"] = self._address
         msg["To"] = to_addr
 
         # Thread context for reply
-        ctx = self._thread_context.get(to_addr, {})
         subject = ctx.get("subject", "Hermes Agent")
         if not subject.startswith("Re:"):
             subject = f"Re: {subject}"
@@ -1279,11 +1346,22 @@ class EmailAdapter(BasePlatformAdapter):
         file_paths: List[str],
     ) -> str:
         """Send an email with multiple file attachments via SMTP."""
+        # Check if we should suppress replies based on the original recipient address
+        ctx = self._thread_context.get(to_addr, {})
+        original_recipient = ctx.get("to_addr", "").lower()
+        
+        if original_recipient and original_recipient in self._no_reply_to:
+            logger.info(
+                "[Email] Suppressing reply with attachments to %s (original recipient: %s is in no-reply list)",
+                to_addr,
+                original_recipient,
+            )
+            return ""  # Return empty message ID to indicate suppressed reply
+        
         msg = MIMEMultipart()
         msg["From"] = self._address
         msg["To"] = to_addr
 
-        ctx = self._thread_context.get(to_addr, {})
         subject = ctx.get("subject", "Hermes Agent")
         if not subject.startswith("Re:"):
             subject = f"Re: {subject}"
@@ -1359,11 +1437,22 @@ class EmailAdapter(BasePlatformAdapter):
         file_name: Optional[str] = None,
     ) -> str:
         """Send an email with a file attachment via SMTP."""
+        # Check if we should suppress replies based on the original recipient address
+        ctx = self._thread_context.get(to_addr, {})
+        original_recipient = ctx.get("to_addr", "").lower()
+        
+        if original_recipient and original_recipient in self._no_reply_to:
+            logger.info(
+                "[Email] Suppressing reply with attachment to %s (original recipient: %s is in no-reply list)",
+                to_addr,
+                original_recipient,
+            )
+            return ""  # Return empty message ID to indicate suppressed reply
+        
         msg = MIMEMultipart()
         msg["From"] = self._address
         msg["To"] = to_addr
 
-        ctx = self._thread_context.get(to_addr, {})
         subject = ctx.get("subject", "Hermes Agent")
         if not subject.startswith("Re:"):
             subject = f"Re: {subject}"
@@ -1461,8 +1550,18 @@ async def _standalone_send(
         msg["Subject"] = "Hermes Agent"
         msg["Date"] = formatdate(localtime=True)
 
+        # For localhost connections, disable certificate verification to support
+        # self-signed certificates (common with local mail bridges like Proton)
+        is_localhost = smtp_host in ("127.0.0.1", "::1", "localhost")
+        if is_localhost:
+            ctx = _ssl.create_default_context()
+            ctx.check_hostname = False
+            ctx.verify_mode = _ssl.CERT_NONE
+        else:
+            ctx = _ssl.create_default_context()
+
         server = smtplib.SMTP(smtp_host, smtp_port)
-        server.starttls(context=_ssl.create_default_context())
+        server.starttls(context=ctx)
         server.login(address, password)
         server.send_message(msg)
         server.quit()

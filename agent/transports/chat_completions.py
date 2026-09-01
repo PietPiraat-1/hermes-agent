@@ -755,6 +755,13 @@ class ChatCompletionsTransport(ProviderTransport):
                 gh_reasoning = params.get("github_reasoning_extra")
                 if gh_reasoning is not None:
                     extra_body["reasoning"] = gh_reasoning
+            elif base_url and "raccoon-fence.ts.net" in str(base_url).lower():
+                # Proton Lumo proxy: expects `reasoning` as a string
+                # ("thinking" or "fast"), not the OpenAI dict format.
+                _effort = "thinking"
+                if reasoning_config and isinstance(reasoning_config, dict):
+                    _effort = reasoning_config.get("effort", "thinking") or "thinking"
+                extra_body["reasoning"] = _effort
             else:
                 _effort = "medium"
                 if reasoning_config and isinstance(reasoning_config, dict):

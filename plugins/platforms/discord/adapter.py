@@ -10416,6 +10416,8 @@ def _apply_yaml_config(yaml_cfg: dict, discord_cfg: dict) -> dict | None:
         os.environ["DISCORD_THREAD_REQUIRE_MENTION"] = str(discord_cfg["thread_require_mention"]).lower()
     if "bots_require_inline_mention" in discord_cfg and not os.getenv("DISCORD_BOTS_REQUIRE_INLINE_MENTION"):
         os.environ["DISCORD_BOTS_REQUIRE_INLINE_MENTION"] = str(discord_cfg["bots_require_inline_mention"]).lower()
+    if "allow_bots" in discord_cfg and not os.getenv("DISCORD_ALLOW_BOTS"):
+        os.environ["DISCORD_ALLOW_BOTS"] = str(discord_cfg["allow_bots"]).lower()
     platforms_cfg = yaml_cfg.get("platforms")
     platform_extra_cfg = {}
     if isinstance(platforms_cfg, dict):
